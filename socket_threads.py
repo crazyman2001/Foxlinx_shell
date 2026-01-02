@@ -16,7 +16,7 @@ from datetime import datetime
 
 
 class NodeUpdateThread(threading.Thread):
-    """Thread 1: Synchronously receives node update data from base board"""
+    """Thread 1: Server socket - synchronously receives node update data from base board"""
     
     def __init__(self, host: str, port: int, timeout: float = 10.0):
         super().__init__(name="NodeUpdateThread", daemon=True)
@@ -24,6 +24,7 @@ class NodeUpdateThread(threading.Thread):
         self.port = port
         self.timeout = timeout
         self.sock: Optional[socket.socket] = None
+        self.client_sock: Optional[socket.socket] = None
         self.running = False
         self.connected = False
         self.lock = threading.Lock()
@@ -33,35 +34,49 @@ class NodeUpdateThread(threading.Thread):
         self.broadcast_node_list: List[str] = []  # List of available broadcast nodes
         
     def run(self):
-        """Main thread execution loop - synchronous receive"""
+        """Main thread execution loop - server mode"""
         self.running = True
-        print(f"[Node Update] Starting node update socket thread")
-        print(f"[Node Update] Connecting to {self.host}:{self.port}")
+        print(f"[Node Update] Starting node update server socket thread")
+        print(f"[Node Update] Listening on {self.host}:{self.port}")
+        
+        # Create server socket
+        if not self.sock:
+            self.sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+            self.sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+            self.sock.settimeout(self.timeout)
+            
+            try:
+                self.sock.bind((self.host, self.port))
+                self.sock.listen(1)
+                print(f"[Node Update] Server listening on {self.host}:{self.port}")
+            except Exception as e:
+                print(f"[Node Update] Bind error: {e}")
+                self.sock.close()
+                self.sock = None
+                return
         
         while self.running:
             try:
-                if not self.sock:
-                    self.sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-                    self.sock.settimeout(self.timeout)
-                
+                # Accept connection from base board
                 if not self.connected:
                     try:
-                        self.sock.connect((self.host, self.port))
+                        self.client_sock, addr = self.sock.accept()
                         self.connected = True
-                        print(f"[Node Update] Connected to base board at {self.host}:{self.port}")
+                        self.client_sock.settimeout(self.timeout)
+                        print(f"[Node Update] Base board connected from {addr}")
+                    except socket.timeout:
+                        # Timeout is normal when waiting for connections
+                        continue
                     except Exception as e:
-                        print(f"[Node Update] Connection failed: {e}")
-                        if self.sock:
-                            self.sock.close()
-                            self.sock = None
+                        print(f"[Node Update] Accept error: {e}")
                         if self.running:
-                            time.sleep(2)
+                            time.sleep(1)
                         continue
                 
-                # Synchronous blocking receive
+                # Synchronous blocking receive from client
                 try:
                     # Receive data length first (assuming 4-byte length prefix)
-                    length_data = self.sock.recv(4)
+                    length_data = self.client_sock.recv(4)
                     if not length_data or len(length_data) < 4:
                         raise ConnectionError("Failed to receive data length")
                     
@@ -71,7 +86,7 @@ class NodeUpdateThread(threading.Thread):
                     received = 0
                     data_parts = []
                     while received < data_length:
-                        chunk = self.sock.recv(min(4096, data_length - received))
+                        chunk = self.client_sock.recv(min(4096, data_length - received))
                         if not chunk:
                             raise ConnectionError("Connection closed during data receive")
                         data_parts.append(chunk)
@@ -81,28 +96,43 @@ class NodeUpdateThread(threading.Thread):
                     self._process_node_update(data.decode('utf-8', errors='ignore'))
                     
                 except socket.timeout:
-                    print(f"[Node Update] Timeout waiting for data")
+                    # Timeout is acceptable, continue waiting
+                    pass
                 except Exception as e:
                     print(f"[Node Update] Receive error: {e}")
                     self.connected = False
-                    if self.sock:
-                        self.sock.close()
-                        self.sock = None
+                    if self.client_sock:
+                        try:
+                            self.client_sock.close()
+                        except:
+                            pass
+                        self.client_sock = None
                     if self.running:
-                        time.sleep(2)
+                        time.sleep(1)
                         
             except Exception as e:
                 print(f"[Node Update] Error: {e}")
                 self.connected = False
-                if self.sock:
+                if self.client_sock:
                     try:
-                        self.sock.close()
+                        self.client_sock.close()
                     except:
                         pass
-                    self.sock = None
+                    self.client_sock = None
                 if self.running:
-                    time.sleep(2)
+                    time.sleep(1)
         
+        # Cleanup
+        if self.client_sock:
+            try:
+                self.client_sock.close()
+            except:
+                pass
+        if self.sock:
+            try:
+                self.sock.close()
+            except:
+                pass
         print(f"[Node Update] Thread stopped")
     
     def _process_node_update(self, data: str):
@@ -179,6 +209,12 @@ class NodeUpdateThread(threading.Thread):
         """Stop the thread gracefully"""
         self.running = False
         self.connected = False
+        if self.client_sock:
+            try:
+                self.client_sock.close()
+            except:
+                pass
+            self.client_sock = None
         if self.sock:
             try:
                 self.sock.close()
@@ -188,7 +224,7 @@ class NodeUpdateThread(threading.Thread):
 
 
 class CommandHandlerThread(threading.Thread):
-    """Thread 2: Command handler - sends commands to base board"""
+    """Thread 2: Server socket - command handler - sends commands to base board"""
     
     def __init__(self, host: str, port: int, timeout: float = 5.0):
         super().__init__(name="CommandHandlerThread", daemon=True)
@@ -196,6 +232,7 @@ class CommandHandlerThread(threading.Thread):
         self.port = port
         self.timeout = timeout
         self.sock: Optional[socket.socket] = None
+        self.client_sock: Optional[socket.socket] = None
         self.running = False
         self.connected = False
         self.lock = threading.Lock()
@@ -203,34 +240,48 @@ class CommandHandlerThread(threading.Thread):
         self.command_lock = threading.Lock()
         
     def run(self):
-        """Main thread execution loop"""
+        """Main thread execution loop - server mode"""
         self.running = True
-        print(f"[Command Handler] Starting command handler socket thread")
-        print(f"[Command Handler] Connecting to {self.host}:{self.port}")
+        print(f"[Command Handler] Starting command handler server socket thread")
+        print(f"[Command Handler] Listening on {self.host}:{self.port}")
+        
+        # Create server socket
+        if not self.sock:
+            self.sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+            self.sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+            self.sock.settimeout(self.timeout)
+            
+            try:
+                self.sock.bind((self.host, self.port))
+                self.sock.listen(1)
+                print(f"[Command Handler] Server listening on {self.host}:{self.port}")
+            except Exception as e:
+                print(f"[Command Handler] Bind error: {e}")
+                self.sock.close()
+                self.sock = None
+                return
         
         while self.running:
             try:
-                if not self.sock:
-                    self.sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-                    self.sock.settimeout(self.timeout)
-                
+                # Accept connection from base board
                 if not self.connected:
                     try:
-                        self.sock.connect((self.host, self.port))
+                        self.client_sock, addr = self.sock.accept()
                         self.connected = True
-                        print(f"[Command Handler] Connected to base board at {self.host}:{self.port}")
+                        self.client_sock.settimeout(self.timeout)
+                        print(f"[Command Handler] Base board connected from {addr}")
+                    except socket.timeout:
+                        # Timeout is normal when waiting for connections
+                        pass
                     except Exception as e:
-                        print(f"[Command Handler] Connection failed: {e}")
-                        if self.sock:
-                            self.sock.close()
-                            self.sock = None
+                        print(f"[Command Handler] Accept error: {e}")
                         if self.running:
-                            time.sleep(2)
+                            time.sleep(1)
                         continue
                 
                 # Process command queue
                 with self.command_lock:
-                    if self.command_queue:
+                    if self.command_queue and self.connected:
                         command = self.command_queue.popleft()
                         self._send_command(command)
                     else:
@@ -239,33 +290,48 @@ class CommandHandlerThread(threading.Thread):
             except Exception as e:
                 print(f"[Command Handler] Error: {e}")
                 self.connected = False
-                if self.sock:
+                if self.client_sock:
                     try:
-                        self.sock.close()
+                        self.client_sock.close()
                     except:
                         pass
-                    self.sock = None
+                    self.client_sock = None
                 if self.running:
-                    time.sleep(2)
+                    time.sleep(1)
         
+        # Cleanup
+        if self.client_sock:
+            try:
+                self.client_sock.close()
+            except:
+                pass
+        if self.sock:
+            try:
+                self.sock.close()
+            except:
+                pass
         print(f"[Command Handler] Thread stopped")
     
     def _send_command(self, command: str):
         """Send command to base board"""
+        if not self.client_sock or not self.connected:
+            print(f"[Command Handler] Not connected, cannot send command")
+            return
+            
         try:
             # Send command with length prefix
             command_bytes = command.encode('utf-8')
             length_bytes = len(command_bytes).to_bytes(4, byteorder='big')
             
-            self.sock.sendall(length_bytes)
-            self.sock.sendall(command_bytes)
+            self.client_sock.sendall(length_bytes)
+            self.client_sock.sendall(command_bytes)
             
             # Wait for response
             try:
-                response_length_data = self.sock.recv(4)
+                response_length_data = self.client_sock.recv(4)
                 if response_length_data and len(response_length_data) == 4:
                     response_length = int.from_bytes(response_length_data, byteorder='big')
-                    response_data = self.sock.recv(response_length)
+                    response_data = self.client_sock.recv(response_length)
                     response = response_data.decode('utf-8', errors='ignore')
                     print(f"[Command Handler] Response: {response}")
                 else:
@@ -278,12 +344,12 @@ class CommandHandlerThread(threading.Thread):
         except Exception as e:
             print(f"[Command Handler] Error sending command: {e}")
             self.connected = False
-            if self.sock:
+            if self.client_sock:
                 try:
-                    self.sock.close()
+                    self.client_sock.close()
                 except:
                     pass
-                self.sock = None
+                self.client_sock = None
     
     def send_command(self, command: str):
         """Add command to queue (thread-safe)"""
@@ -304,7 +370,7 @@ class CommandHandlerThread(threading.Thread):
 
 
 class RealTimeDataThread(threading.Thread):
-    """Thread 3: Real-time data monitoring - receives sensor data from base board"""
+    """Thread 3: Server socket - real-time data monitoring - receives sensor data from base board"""
     
     def __init__(self, host: str, port: int, max_data_points: int = 1000, timeout: float = 5.0):
         super().__init__(name="RealTimeDataThread", daemon=True)
@@ -312,6 +378,7 @@ class RealTimeDataThread(threading.Thread):
         self.port = port
         self.timeout = timeout
         self.sock: Optional[socket.socket] = None
+        self.client_sock: Optional[socket.socket] = None
         self.running = False
         self.connected = False
         self.lock = threading.Lock()
@@ -322,35 +389,49 @@ class RealTimeDataThread(threading.Thread):
         self.last_display_time = time.time()
         
     def run(self):
-        """Main thread execution loop"""
+        """Main thread execution loop - server mode"""
         self.running = True
-        print(f"[Real-time Data] Starting real-time data monitoring socket thread")
-        print(f"[Real-time Data] Connecting to {self.host}:{self.port}")
+        print(f"[Real-time Data] Starting real-time data monitoring server socket thread")
+        print(f"[Real-time Data] Listening on {self.host}:{self.port}")
+        
+        # Create server socket
+        if not self.sock:
+            self.sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+            self.sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+            self.sock.settimeout(self.timeout)
+            
+            try:
+                self.sock.bind((self.host, self.port))
+                self.sock.listen(1)
+                print(f"[Real-time Data] Server listening on {self.host}:{self.port}")
+            except Exception as e:
+                print(f"[Real-time Data] Bind error: {e}")
+                self.sock.close()
+                self.sock = None
+                return
         
         while self.running:
             try:
-                if not self.sock:
-                    self.sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-                    self.sock.settimeout(self.timeout)
-                
+                # Accept connection from base board
                 if not self.connected:
                     try:
-                        self.sock.connect((self.host, self.port))
+                        self.client_sock, addr = self.sock.accept()
                         self.connected = True
-                        print(f"[Real-time Data] Connected to base board at {self.host}:{self.port}")
+                        self.client_sock.settimeout(self.timeout)
+                        print(f"[Real-time Data] Base board connected from {addr}")
+                    except socket.timeout:
+                        # Timeout is normal when waiting for connections
+                        continue
                     except Exception as e:
-                        print(f"[Real-time Data] Connection failed: {e}")
-                        if self.sock:
-                            self.sock.close()
-                            self.sock = None
+                        print(f"[Real-time Data] Accept error: {e}")
                         if self.running:
-                            time.sleep(2)
+                            time.sleep(1)
                         continue
                 
-                # Receive sensor data
+                # Receive sensor data from client
                 try:
                     # Receive data length
-                    length_data = self.sock.recv(4)
+                    length_data = self.client_sock.recv(4)
                     if not length_data or len(length_data) < 4:
                         raise ConnectionError("Failed to receive data length")
                     
@@ -360,7 +441,7 @@ class RealTimeDataThread(threading.Thread):
                     received = 0
                     data_parts = []
                     while received < data_length:
-                        chunk = self.sock.recv(min(4096, data_length - received))
+                        chunk = self.client_sock.recv(min(4096, data_length - received))
                         if not chunk:
                             raise ConnectionError("Connection closed during data receive")
                         data_parts.append(chunk)
@@ -376,29 +457,43 @@ class RealTimeDataThread(threading.Thread):
                         self.last_display_time = current_time
                     
                 except socket.timeout:
-                    # Timeout is acceptable, just continue
+                    # Timeout is acceptable, continue waiting
                     pass
                 except Exception as e:
                     print(f"[Real-time Data] Receive error: {e}")
                     self.connected = False
-                    if self.sock:
-                        self.sock.close()
-                        self.sock = None
+                    if self.client_sock:
+                        try:
+                            self.client_sock.close()
+                        except:
+                            pass
+                        self.client_sock = None
                     if self.running:
-                        time.sleep(2)
+                        time.sleep(1)
                         
             except Exception as e:
                 print(f"[Real-time Data] Error: {e}")
                 self.connected = False
-                if self.sock:
+                if self.client_sock:
                     try:
-                        self.sock.close()
+                        self.client_sock.close()
                     except:
                         pass
-                    self.sock = None
+                    self.client_sock = None
                 if self.running:
-                    time.sleep(2)
+                    time.sleep(1)
         
+        # Cleanup
+        if self.client_sock:
+            try:
+                self.client_sock.close()
+            except:
+                pass
+        if self.sock:
+            try:
+                self.sock.close()
+            except:
+                pass
         print(f"[Real-time Data] Thread stopped")
     
     def _process_sensor_data(self, data: str):
@@ -474,6 +569,12 @@ class RealTimeDataThread(threading.Thread):
         """Stop the thread gracefully"""
         self.running = False
         self.connected = False
+        if self.client_sock:
+            try:
+                self.client_sock.close()
+            except:
+                pass
+            self.client_sock = None
         if self.sock:
             try:
                 self.sock.close()
@@ -642,26 +743,26 @@ def main():
     # Create socket manager
     manager = SocketManager()
     
-    # Configuration - Update these with your base board addresses
-    # Node Update Socket
-    NODE_UPDATE_HOST = '192.168.1.100'  # Base board IP
+    # Configuration - Server sockets listening on these addresses
+    # Node Update Socket (Server)
+    NODE_UPDATE_HOST = '0.0.0.0'  # Listen on all interfaces
     NODE_UPDATE_PORT = 8001
     
-    # Command Handler Socket
-    COMMAND_HANDLER_HOST = '192.168.1.100'  # Base board IP
+    # Command Handler Socket (Server)
+    COMMAND_HANDLER_HOST = '0.0.0.0'  # Listen on all interfaces
     COMMAND_HANDLER_PORT = 8002
     
-    # Real-time Data Monitoring Socket
-    REALTIME_DATA_HOST = '192.168.1.100'  # Base board IP
+    # Real-time Data Monitoring Socket (Server)
+    REALTIME_DATA_HOST = '0.0.0.0'  # Listen on all interfaces
     REALTIME_DATA_PORT = 8003
     
     print("=" * 60)
     print("Embedded Linux Socket Threading Application")
-    print("iMX92 MCU - Base Board Communication")
+    print("iMX92 MCU - Server Sockets (Waiting for Base Board)")
     print("=" * 60)
-    print(f"Thread 1 - Node Update: {NODE_UPDATE_HOST}:{NODE_UPDATE_PORT}")
-    print(f"Thread 2 - Command Handler: {COMMAND_HANDLER_HOST}:{COMMAND_HANDLER_PORT}")
-    print(f"Thread 3 - Real-time Data: {REALTIME_DATA_HOST}:{REALTIME_DATA_PORT}")
+    print(f"Thread 1 - Node Update Server: {NODE_UPDATE_HOST}:{NODE_UPDATE_PORT}")
+    print(f"Thread 2 - Command Handler Server: {COMMAND_HANDLER_HOST}:{COMMAND_HANDLER_PORT}")
+    print(f"Thread 3 - Real-time Data Server: {REALTIME_DATA_HOST}:{REALTIME_DATA_PORT}")
     print("=" * 60)
     
     # Start all threads

@@ -16,25 +16,28 @@ This Python application creates 3 worker threads (in addition to the main thread
 
 ## Thread Details
 
-### Thread 1: Node Update Socket
-- **Purpose**: Synchronously receives node update data from base board
+### Thread 1: Node Update Socket (Server)
+- **Purpose**: Server socket that synchronously receives node update data from base board
 - **Data Received**:
   - List of connected devices with their status (active/deactive)
   - Available broadcast node list
-- **Behavior**: Blocking receive - waits for data from base board
+- **Behavior**: Server listens for connections from base board, blocking receive - waits for data
 - **Display**: Automatically displays updates when received
+- **Port**: Default 8001
 
-### Thread 2: Command Handler Socket
-- **Purpose**: Sends commands to base board
+### Thread 2: Command Handler Socket (Server)
+- **Purpose**: Server socket that sends commands to base board
 - **Input**: Commands entered from shell (Forlinx terminal)
-- **Behavior**: Queues commands and sends them to base board
+- **Behavior**: Server listens for base board connection, queues commands and sends them to connected base board
 - **Response**: Displays response from base board
+- **Port**: Default 8002
 
-### Thread 3: Real-time Data Monitoring Socket
-- **Purpose**: Receives real-time sensor data from base board
+### Thread 3: Real-time Data Monitoring Socket (Server)
+- **Purpose**: Server socket that receives real-time sensor data from base board
 - **Storage**: Maintains a list of sensor data points (configurable max size, default 1000)
 - **Display**: Periodically displays recent sensor data (every 2 seconds)
 - **Data Format**: Supports JSON or simple key-value format
+- **Port**: Default 8003
 
 ## Requirements
 
@@ -47,18 +50,20 @@ This Python application creates 3 worker threads (in addition to the main thread
 Edit the configuration section in the `main()` function:
 
 ```python
-# Node Update Socket
-NODE_UPDATE_HOST = '192.168.1.100'  # Base board IP
+# Node Update Socket (Server)
+NODE_UPDATE_HOST = '0.0.0.0'  # Listen on all interfaces
 NODE_UPDATE_PORT = 8001
 
-# Command Handler Socket
-COMMAND_HANDLER_HOST = '192.168.1.100'  # Base board IP
+# Command Handler Socket (Server)
+COMMAND_HANDLER_HOST = '0.0.0.0'  # Listen on all interfaces
 COMMAND_HANDLER_PORT = 8002
 
-# Real-time Data Monitoring Socket
-REALTIME_DATA_HOST = '192.168.1.100'  # Base board IP
+# Real-time Data Monitoring Socket (Server)
+REALTIME_DATA_HOST = '0.0.0.0'  # Listen on all interfaces
 REALTIME_DATA_PORT = 8003
 ```
+
+**Note**: All sockets are configured as servers. The base board will connect to these server sockets. Use `0.0.0.0` to listen on all network interfaces, or specify a specific IP address to listen on a particular interface.
 
 ## Usage
 
@@ -133,9 +138,11 @@ All sockets use a length-prefixed protocol:
 
 ### Socket Behavior
 
-- **Node Update**: Client socket that connects to base board and synchronously receives data
-- **Command Handler**: Client socket that connects to base board and sends commands
-- **Real-time Data**: Client socket that connects to base board and continuously receives sensor data
+- **Node Update**: Server socket that listens for base board connections and synchronously receives data
+- **Command Handler**: Server socket that listens for base board connections and sends commands
+- **Real-time Data**: Server socket that listens for base board connections and continuously receives sensor data
+
+**All sockets operate as servers** - the base board acts as the client and connects to these server sockets.
 
 ## Customization
 
@@ -184,19 +191,22 @@ Thread 3 - Real-time Data: 192.168.1.100:8003
 ## Notes for iMX92 / Forlinx
 
 - Ensure network interfaces are properly configured
-- Check firewall rules if connections fail
+- Check firewall rules if connections fail (servers need ports open for incoming connections)
 - Monitor system resources (memory, CPU) with multiple threads
 - Consider using `systemd` service for auto-start on boot
 - Test socket connections independently before running full application
-- Ensure base board is configured to accept connections on specified ports
+- **Base board must be configured to connect to these server sockets** (as clients)
+- Ensure ports 8001, 8002, 8003 are not blocked by firewall
+- Use `netstat -tuln` or `ss -tuln` to verify servers are listening
 
 ## Troubleshooting
 
 ### Connection Failures
-- Verify base board IP address and port numbers
-- Check network connectivity: `ping <base_board_ip>`
-- Verify base board is listening on specified ports
-- Check firewall/iptables rules
+- Verify server sockets are listening: `netstat -tuln | grep 800`
+- Check firewall/iptables rules to ensure ports are open for incoming connections
+- Verify base board can reach the iMX92 device
+- Check network connectivity: `ping <imx92_ip>` from base board
+- Ensure base board is configured to connect to the correct IP and ports
 
 ### Data Not Displaying
 - Verify data format matches expected format (JSON or simple)
