@@ -843,9 +843,13 @@ class RealTimeDataThread(threading.Thread):
 class CommandInputThread(threading.Thread):
     """Separate thread to handle command input from shell"""
     
-    def __init__(self, command_handler: CommandHandlerThread):
+    def __init__(self, command_handler: CommandHandlerThread, node_update_thread=None, 
+                 realtime_data_thread=None, manager=None):
         super().__init__(name="CommandInputThread", daemon=True)
         self.command_handler = command_handler
+        self.node_update_thread = node_update_thread
+        self.realtime_data_thread = realtime_data_thread
+        self.manager = manager
         self.running = False
         
     def run(self):
@@ -869,6 +873,9 @@ class CommandInputThread(threading.Thread):
                     
                     if command.lower() == 'exit' or command.lower() == 'quit':
                         print("[Command Input] Exiting...")
+                        # Signal manager to stop all threads
+                        if self.manager:
+                            self.manager.stop_all()
                         break
                     
                     if command.lower() == 'status':
@@ -905,10 +912,66 @@ class CommandInputThread(threading.Thread):
         print("=" * 60 + "\n")
     
     def _show_status(self):
-        """Show status of all threads"""
+        """Show status of all threads and their data"""
         print("\n" + "=" * 60)
         print("Thread Status:")
-        print(f"  Node Update: {'Connected' if self.command_handler.connected else 'Disconnected'}")
+        print("-" * 60)
+        
+        # Node Update Thread Status
+        if self.node_update_thread:
+            node_status = "Connected" if self.node_update_thread.connected else "Disconnected"
+            print(f"  Node Update Thread: {node_status}")
+            
+            # Get node information
+            devices, broadcast_nodes = self.node_update_thread.get_node_info()
+            
+            if devices:
+                print("\n  Connected Devices:")
+                for device_id, status in devices.items():
+                    status_icon = "✓" if status.lower() == "active" else "✗"
+                    print(f"    {status_icon} {device_id}: {status}")
+            else:
+                print("\n  Connected Devices: None")
+            
+            if broadcast_nodes:
+                print("\n  Available Broadcast Nodes:")
+                for node in broadcast_nodes:
+                    print(f"    • {node}")
+            else:
+                print("\n  Available Broadcast Nodes: None")
+        else:
+            print("  Node Update Thread: Not initialized")
+        
+        # Command Handler Thread Status
+        if self.command_handler:
+            cmd_status = "Connected" if self.command_handler.connected else "Disconnected"
+            print(f"\n  Command Handler Thread: {cmd_status}")
+        else:
+            print("\n  Command Handler Thread: Not initialized")
+        
+        # Real-time Data Thread Status
+        if self.realtime_data_thread:
+            data_status = "Connected" if self.realtime_data_thread.connected else "Disconnected"
+            print(f"\n  Real-time Data Thread: {data_status}")
+            
+            # Get sensor data count
+            sensor_data = self.realtime_data_thread.get_sensor_data()
+            print(f"  Sensor Data Points Stored: {len(sensor_data)}")
+            
+            # Show most recent data point if available
+            if sensor_data:
+                latest = sensor_data[-1]
+                device_data = {k: v for k, v in latest.items() if k != 'timestamp'}
+                if device_data:
+                    print("  Most Recent Data:")
+                    for device_id, value in device_data.items():
+                        if isinstance(value, float):
+                            print(f"    {device_id}: {value:.2f}")
+                        else:
+                            print(f"    {device_id}: {value}")
+        else:
+            print("\n  Real-time Data Thread: Not initialized")
+        
         print("=" * 60 + "\n")
     
     def stop(self):
@@ -945,7 +1008,12 @@ class SocketManager:
         self.node_update_thread = NodeUpdateThread(node_update_host, node_update_port)
         self.command_handler_thread = CommandHandlerThread(command_handler_host, command_handler_port)
         self.realtime_data_thread = RealTimeDataThread(realtime_data_host, realtime_data_port)
-        self.command_input_thread = CommandInputThread(self.command_handler_thread)
+        self.command_input_thread = CommandInputThread(
+            self.command_handler_thread,
+            node_update_thread=self.node_update_thread,
+            realtime_data_thread=self.realtime_data_thread,
+            manager=self
+        )
         
         # Start threads
         self.node_update_thread.start()
@@ -1043,11 +1111,18 @@ def main():
     # Main loop - monitor threads
     try:
         while manager.running and manager.is_any_alive():
-            time.sleep(1)
+            time.sleep(0.5)
+            # Check if command input thread stopped (user typed exit/quit)
+            if manager.command_input_thread and not manager.command_input_thread.is_alive():
+                if manager.running:
+                    print("\n[Main] Command input thread stopped, shutting down...")
+                    manager.stop_all()
+                    break
     except KeyboardInterrupt:
-        pass
+        print("\n[Main] Keyboard interrupt received, shutting down...")
     finally:
-        manager.stop_all()
+        if manager.running:
+            manager.stop_all()
         print("Application stopped")
 
 

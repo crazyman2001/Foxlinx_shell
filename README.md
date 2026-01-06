@@ -6,13 +6,15 @@ This Python application creates 3 worker threads (in addition to the main thread
 
 - **3 Specialized Socket Threads**: Each thread has a specific purpose
   - **Node Update Socket**: Synchronously receives device status and broadcast node information
-  - **Command Handler Socket**: Sends commands to base board from shell input
+  - **Command Handler Socket**: Sends commands to base board from shell input or terminal clients
   - **Real-time Data Monitoring Socket**: Receives and stores sensor data with periodic display
 - **Automatic Reconnection**: All threads automatically reconnect on connection failures
 - **Thread-Safe Data Storage**: Uses proper locking mechanisms for data access
 - **Command Input Interface**: Interactive shell for sending commands to base board
+- **Comprehensive Status Command**: View all thread status, connected devices, broadcast nodes, and sensor data
 - **Data Display**: Automatic display of node updates and sensor data
-- **Graceful Shutdown**: Handles SIGINT and SIGTERM signals for clean shutdown
+- **Dual Protocol Support**: Supports both length-prefixed (production) and raw text (testing) protocols
+- **Graceful Shutdown**: Handles SIGINT and SIGTERM signals, plus exit/quit commands for clean shutdown
 
 ## Thread Details
 
@@ -27,16 +29,18 @@ This Python application creates 3 worker threads (in addition to the main thread
 
 ### Thread 2: Command Handler Socket (Server)
 - **Purpose**: Server socket that sends commands to base board
-- **Input**: Commands entered from shell (Forlinx terminal)
-- **Behavior**: Server listens for base board connection, queues commands and sends them to connected base board
-- **Response**: Displays response from base board
+- **Input**: Commands entered from shell (Forlinx terminal) or from connected clients (PuTTY/Tera Term)
+- **Behavior**: Server listens for base board connection, accepts commands from shell or clients and sends them as raw text to connected base board
+- **Command Format**: Commands are sent as-is (raw text), no length prefix. Example: `"CMD:REQ_CONN:21001A0012505037 5555"`
+- **Response**: Displays response from base board (supports both length-prefixed and raw text responses)
 - **Port**: Default 8002
 
 ### Thread 3: Real-time Data Monitoring Socket (Server)
 - **Purpose**: Server socket that receives real-time sensor data from base board
 - **Storage**: Maintains a list of sensor data points (configurable max size, default 1000)
 - **Display**: Periodically displays recent sensor data (every 2 seconds)
-- **Data Format**: Supports JSON or simple key-value format
+- **Data Format**: Supports JSON format with device IDs (e.g., `{"21001A0012505037":"1195.0"}`) or simple key-value format
+- **Features**: Automatically converts numeric string values to floats, adds timestamps to all data points
 - **Port**: Default 8003
 
 ## Requirements
@@ -79,15 +83,24 @@ Once the application starts, you can enter commands in the shell:
 
 ```
 > help          # Show available commands
-> status        # Show connection status
-> <command>     # Send any command to base board
-> exit          # Exit the application
+> status        # Show comprehensive status of all threads, connected devices, broadcast nodes, and sensor data
+> <command>     # Send any command to base board (e.g., "CMD:REQ_CONN:21001A0012505037 5555")
+> exit          # Exit the application gracefully
+> quit          # Exit the application gracefully (same as exit)
 ```
+
+#### Status Command Details:
+
+The `status` command provides a comprehensive overview:
+- **Thread Connection Status**: Shows if each of the 3 threads is connected
+- **Connected Devices**: Lists all devices with their status (active/deactive)
+- **Broadcast Nodes**: Shows available broadcast nodes
+- **Sensor Data**: Displays count of stored data points and most recent sensor reading
 
 ### Stopping the application:
 
-- Type `exit` or `quit` in the command interface, or
-- Press `Ctrl+C` in the terminal
+- Type `exit` or `quit` in the command interface - this will gracefully stop all threads and exit
+- Press `Ctrl+C` in the terminal - this will also gracefully shutdown the application
 
 ## Data Formats
 
@@ -114,7 +127,16 @@ device1:active,device2:deactive,device3:active|node1,node2,node3
 
 ### Sensor Data Format
 
-**JSON Format:**
+**JSON Format (Real-time Data):**
+```json
+{
+  "21001A0012505037": "1195.0"
+}
+```
+
+The format uses device IDs as keys and sensor values as strings. Numeric values are automatically converted to floats for processing.
+
+**Alternative JSON Format:**
 ```json
 {
   "sensor1": 25.5,
@@ -132,9 +154,16 @@ sensor1:25.5,sensor2:100,sensor3:on
 
 ### Data Transmission Protocol
 
-All sockets use a length-prefixed protocol:
+All sockets support both protocols:
+
+**Length-Prefixed Protocol (Production):**
 1. First 4 bytes: Data length (big-endian)
 2. Remaining bytes: Actual data (UTF-8 encoded)
+
+**Raw Text Protocol (Testing):**
+- Data sent directly as UTF-8 text (no length prefix)
+- Automatically detected and handled
+- Useful for testing with PuTTY, Tera Term, or other terminal clients
 
 ### Socket Behavior
 
@@ -169,23 +198,91 @@ NodeUpdateThread(host, port, timeout=10.0)  # 10 second timeout
 
 ## Example Output
 
+### Application Startup:
+
 ```
 ============================================================
 Embedded Linux Socket Threading Application
-iMX92 MCU - Base Board Communication
+iMX92 MCU - Server Sockets (Waiting for Base Board)
 ============================================================
-Thread 1 - Node Update: 192.168.1.100:8001
-Thread 2 - Command Handler: 192.168.1.100:8002
-Thread 3 - Real-time Data: 192.168.1.100:8003
+Thread 1 - Node Update Server: Listening on 0.0.0.0:8001
+Thread 2 - Command Handler Server: Listening on 0.0.0.0:8002
+Thread 3 - Real-time Data Server: Listening on 0.0.0.0:8003
+------------------------------------------------------------
+Client Connection Information:
+  Use these IP addresses to connect from client software:
+    • 127.0.0.1 (localhost)
+      - Node Update: 127.0.0.1:8001
+      - Command Handler: 127.0.0.1:8002
+      - Real-time Data: 127.0.0.1:8003
 ============================================================
 
-[Node Update] Starting node update socket thread
-[Command Handler] Starting command handler socket thread
-[Real-time Data] Starting real-time data monitoring socket thread
+[Node Update] Starting node update server socket thread
+[Command Handler] Starting command handler server socket thread
+[Real-time Data] Starting real-time data monitoring server socket thread
 
 [Command Input] Ready to accept commands. Type 'help' for available commands.
 
 > 
+```
+
+### Status Command Output:
+
+```
+> status
+
+============================================================
+Thread Status:
+------------------------------------------------------------
+  Node Update Thread: Connected
+
+  Connected Devices:
+    ✓ 21001A0012505037: active
+
+  Available Broadcast Nodes:
+    • 2D000A0012505037
+
+  Command Handler Thread: Connected
+
+  Real-time Data Thread: Connected
+  Sensor Data Points Stored: 15
+  Most Recent Data:
+    21001A0012505037: 1195.00
+============================================================
+```
+
+### Node Update Display:
+
+```
+============================================================
+[Node Update] Update received at 2026-01-06 12:08:59
+------------------------------------------------------------
+Connected Devices:
+  ✓ 21001A0012505037: active
+
+Available Broadcast Nodes:
+  • 2D000A0012505037
+============================================================
+```
+
+### Real-time Sensor Data Display:
+
+```
+============================================================
+[Real-time Data] Sensor Data Update - 2026-01-06 12:09:01
+------------------------------------------------------------
+Total data points stored: 15
+
+Most Recent Data Points:
+
+  Data Point 1:
+    Device ID: 21001A0012505037  |  Value: 1195.00
+    Time: 12:09:01
+
+  Data Point 2:
+    Device ID: 21001A0012505037  |  Value: 1196.50
+    Time: 12:09:02
+============================================================
 ```
 
 ## Notes for iMX92 / Forlinx
@@ -210,8 +307,10 @@ Thread 3 - Real-time Data: 192.168.1.100:8003
 
 ### Data Not Displaying
 - Verify data format matches expected format (JSON or simple)
-- Check if data is being received (check thread status)
+- Use `status` command to check thread connection status and see if data is being received
 - Verify socket connections are established
+- Check terminal output for error messages
+- For real-time data, ensure data is being sent in the correct format: `{"device_id":"value"}`
 
 ### Commands Not Working
 - Verify command handler thread is connected
