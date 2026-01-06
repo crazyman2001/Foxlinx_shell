@@ -15,6 +15,49 @@ from collections import deque
 from datetime import datetime
 
 
+def get_local_ip_addresses():
+    """Get list of local IP addresses that clients can use to connect"""
+    ip_addresses = []
+    
+    # Add localhost
+    ip_addresses.append(('127.0.0.1', 'localhost'))
+    
+    # Get actual network IP addresses
+    try:
+        # Connect to a remote address to determine local IP
+        # This doesn't actually send data, just determines the route
+        s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        try:
+            # Connect to a public DNS server (doesn't actually connect)
+            s.connect(('8.8.8.8', 80))
+            local_ip = s.getsockname()[0]
+            ip_addresses.append((local_ip, 'network interface'))
+        except Exception:
+            pass
+        finally:
+            s.close()
+    except Exception:
+        pass
+    
+    # Try to get all network interfaces
+    try:
+        import subprocess
+        if sys.platform == 'win32':
+            # Windows: ipconfig
+            result = subprocess.run(['ipconfig'], capture_output=True, text=True, timeout=2)
+            for line in result.stdout.split('\n'):
+                if 'IPv4 Address' in line or 'IPv4' in line:
+                    parts = line.split(':')
+                    if len(parts) > 1:
+                        ip = parts[1].strip().split()[0]
+                        if ip and ip not in [ip[0] for ip in ip_addresses]:
+                            ip_addresses.append((ip, 'network interface'))
+    except Exception:
+        pass
+    
+    return ip_addresses
+
+
 class NodeUpdateThread(threading.Thread):
     """Thread 1: Server socket - synchronously receives node update data from base board"""
     
@@ -75,25 +118,54 @@ class NodeUpdateThread(threading.Thread):
                 
                 # Synchronous blocking receive from client
                 try:
-                    # Receive data length first (assuming 4-byte length prefix)
-                    length_data = self.client_sock.recv(4)
-                    if not length_data or len(length_data) < 4:
-                        raise ConnectionError("Failed to receive data length")
+                    # Try to receive with length prefix first, fallback to raw text
+                    # Peek at first 4 bytes to determine protocol
+                    self.client_sock.settimeout(0.5)
+                    try:
+                        peek_data = self.client_sock.recv(4, socket.MSG_PEEK)
+                        if len(peek_data) == 4:
+                            # Check if first 4 bytes look like a length prefix (reasonable size)
+                            try:
+                                potential_length = int.from_bytes(peek_data, byteorder='big')
+                                # If it's a reasonable length (less than 64KB), try length-prefixed
+                                if 0 < potential_length < 65536:
+                                    # Consume the 4 bytes we peeked
+                                    length_data = self.client_sock.recv(4)
+                                    data_length = potential_length
+                                    
+                                    # Receive actual data
+                                    received = 0
+                                    data_parts = []
+                                    while received < data_length:
+                                        chunk = self.client_sock.recv(min(4096, data_length - received))
+                                        if not chunk:
+                                            raise ConnectionError("Connection closed during data receive")
+                                        data_parts.append(chunk)
+                                        received += len(chunk)
+                                    
+                                    data = b''.join(data_parts)
+                                    self._process_node_update(data.decode('utf-8', errors='ignore'))
+                                    self.client_sock.settimeout(self.timeout)
+                                    continue
+                            except (ValueError, OverflowError):
+                                # Not a valid length, treat as raw text
+                                pass
+                    except socket.timeout:
+                        # No data available yet
+                        self.client_sock.settimeout(self.timeout)
+                        continue
                     
-                    data_length = int.from_bytes(length_data, byteorder='big')
+                    # Fallback: Receive raw text (for testing with PuTTY/Tera Term)
+                    self.client_sock.settimeout(self.timeout)
+                    raw_data = self.client_sock.recv(4096)
+                    if not raw_data:
+                        raise ConnectionError("Connection closed")
                     
-                    # Receive actual data
-                    received = 0
-                    data_parts = []
-                    while received < data_length:
-                        chunk = self.client_sock.recv(min(4096, data_length - received))
-                        if not chunk:
-                            raise ConnectionError("Connection closed during data receive")
-                        data_parts.append(chunk)
-                        received += len(chunk)
-                    
-                    data = b''.join(data_parts)
-                    self._process_node_update(data.decode('utf-8', errors='ignore'))
+                    # Decode and process
+                    data = raw_data.decode('utf-8', errors='ignore').strip()
+                    if data:
+                        print(f"[Node Update] Received raw text data (length: {len(data)} bytes)")
+                        self._process_node_update(data)
                     
                 except socket.timeout:
                     # Timeout is acceptable, continue waiting
@@ -141,19 +213,37 @@ class NodeUpdateThread(threading.Thread):
             # Try to parse as JSON
             update_data = json.loads(data)
             
+            # Validate data structure
+            if not isinstance(update_data, dict):
+                raise ValueError("JSON root must be an object")
+            
             with self.lock:
                 # Update connected devices
                 if 'devices' in update_data:
-                    self.connected_devices = update_data['devices']
+                    if isinstance(update_data['devices'], dict):
+                        self.connected_devices = update_data['devices']
+                    else:
+                        print(f"[Node Update] Warning: 'devices' should be an object, got {type(update_data['devices'])}")
                 
                 # Update broadcast node list
                 if 'broadcast_nodes' in update_data:
-                    self.broadcast_node_list = update_data['broadcast_nodes']
+                    if isinstance(update_data['broadcast_nodes'], list):
+                        # Ensure all items are strings
+                        self.broadcast_node_list = [str(node) for node in update_data['broadcast_nodes']]
+                    elif isinstance(update_data['broadcast_nodes'], dict):
+                        # Convert dict to list of keys (for compatibility)
+                        print(f"[Node Update] Warning: 'broadcast_nodes' should be a list, converting dict keys to list")
+                        self.broadcast_node_list = list(update_data['broadcast_nodes'].keys())
+                    else:
+                        print(f"[Node Update] Warning: 'broadcast_nodes' should be a list, got {type(update_data['broadcast_nodes'])}")
             
             # Display update
             self._display_node_update()
             
-        except json.JSONDecodeError:
+        except json.JSONDecodeError as e:
+            print(f"[Node Update] JSON decode error: {e}")
+            print(f"[Node Update] Invalid JSON at line {e.lineno}, column {e.colno}")
+            print(f"[Node Update] Received data: {data[:200]}...")
             # If not JSON, try to parse as simple format
             # Format: "device1:active,device2:deactive|node1,node2,node3"
             try:
@@ -174,9 +264,12 @@ class NodeUpdateThread(threading.Thread):
                         self.broadcast_node_list = nodes
                 
                 self._display_node_update()
-            except Exception as e:
-                print(f"[Node Update] Parse error: {e}")
+            except Exception as e2:
+                print(f"[Node Update] Parse error: {e2}")
                 print(f"[Node Update] Raw data: {data}")
+        except Exception as e:
+            print(f"[Node Update] Processing error: {e}")
+            print(f"[Node Update] Raw data: {data[:200]}...")
     
     def _display_node_update(self):
         """Display current node update information"""
@@ -756,13 +849,24 @@ def main():
     REALTIME_DATA_HOST = '0.0.0.0'  # Listen on all interfaces
     REALTIME_DATA_PORT = 8003
     
+    # Get local IP addresses for client connections
+    local_ips = get_local_ip_addresses()
+    
     print("=" * 60)
     print("Embedded Linux Socket Threading Application")
     print("iMX92 MCU - Server Sockets (Waiting for Base Board)")
     print("=" * 60)
-    print(f"Thread 1 - Node Update Server: {NODE_UPDATE_HOST}:{NODE_UPDATE_PORT}")
-    print(f"Thread 2 - Command Handler Server: {COMMAND_HANDLER_HOST}:{COMMAND_HANDLER_PORT}")
-    print(f"Thread 3 - Real-time Data Server: {REALTIME_DATA_HOST}:{REALTIME_DATA_PORT}")
+    print(f"Thread 1 - Node Update Server: Listening on {NODE_UPDATE_HOST}:{NODE_UPDATE_PORT}")
+    print(f"Thread 2 - Command Handler Server: Listening on {COMMAND_HANDLER_HOST}:{COMMAND_HANDLER_PORT}")
+    print(f"Thread 3 - Real-time Data Server: Listening on {REALTIME_DATA_HOST}:{REALTIME_DATA_PORT}")
+    print("-" * 60)
+    print("Client Connection Information:")
+    print("  Use these IP addresses to connect from client software:")
+    for ip, desc in local_ips:
+        print(f"    • {ip} ({desc})")
+        print(f"      - Node Update: {ip}:{NODE_UPDATE_PORT}")
+        print(f"      - Command Handler: {ip}:{COMMAND_HANDLER_PORT}")
+        print(f"      - Real-time Data: {ip}:{REALTIME_DATA_PORT}")
     print("=" * 60)
     
     # Start all threads
