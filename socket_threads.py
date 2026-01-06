@@ -94,9 +94,15 @@ class NodeUpdateThread(threading.Thread):
                 print(f"[Node Update] Server listening on {self.host}:{self.port}")
             except Exception as e:
                 print(f"[Node Update] Bind error: {e}")
-                self.sock.close()
+                if self.sock:
+                    self.sock.close()
                 self.sock = None
                 return
+        
+        # Check if server socket was created successfully
+        if not self.sock:
+            print(f"[Node Update] Server socket not initialized, thread stopping")
+            return
         
         while self.running:
             try:
@@ -116,10 +122,17 @@ class NodeUpdateThread(threading.Thread):
                             time.sleep(1)
                         continue
                 
+                # Only process if we have a connected client
+                if not self.client_sock or not self.connected:
+                    time.sleep(0.1)
+                    continue
+                
                 # Synchronous blocking receive from client
                 try:
                     # Try to receive with length prefix first, fallback to raw text
                     # Peek at first 4 bytes to determine protocol
+                    if not self.client_sock:
+                        continue
                     self.client_sock.settimeout(0.5)
                     try:
                         peek_data = self.client_sock.recv(4, socket.MSG_PEEK)
@@ -354,34 +367,79 @@ class CommandHandlerThread(threading.Thread):
                 self.sock = None
                 return
         
+        # Check if server socket was created successfully
+        if not self.sock:
+            print(f"[Command Handler] Server socket not initialized, thread stopping")
+            return
+        
         while self.running:
             try:
-                # Accept connection from base board
+                # Accept connection from base board or terminal client
                 if not self.connected:
+                    if not self.sock:
+                        print(f"[Command Handler] Server socket is None, cannot accept connections")
+                        time.sleep(1)
+                        continue
                     try:
                         self.client_sock, addr = self.sock.accept()
                         self.connected = True
-                        self.client_sock.settimeout(self.timeout)
-                        print(f"[Command Handler] Base board connected from {addr}")
+                        if self.client_sock:
+                            self.client_sock.settimeout(self.timeout)
+                            print(f"[Command Handler] Client connected from {addr}")
                     except socket.timeout:
                         # Timeout is normal when waiting for connections
-                        pass
+                        continue
                     except Exception as e:
                         print(f"[Command Handler] Accept error: {e}")
                         if self.running:
                             time.sleep(1)
                         continue
                 
-                # Process command queue
+                # Only process if we have a connected client
+                if not self.client_sock or not self.connected:
+                    time.sleep(0.1)
+                    continue
+                
+                # Check for incoming commands from connected client (raw text from PuTTY/Tera Term)
+                # Commands received from client are sent as-is (raw text) to the base board
+                try:
+                    if self.client_sock:
+                        self.client_sock.settimeout(0.1)  # Short timeout for non-blocking check
+                        raw_data = self.client_sock.recv(4096)
+                        if raw_data:
+                            # Received command from client (PuTTY/Tera Term), send as raw text to base board
+                            command = raw_data.decode('utf-8', errors='ignore').strip()
+                            if command:
+                                print(f"[Command Handler] Received command from client: {command}")
+                                # Send command as raw text (as-is, no length prefix)
+                                self._send_raw_command(command)
+                        if self.client_sock:
+                            self.client_sock.settimeout(self.timeout)
+                except socket.timeout:
+                    # No data from client, continue
+                    if self.client_sock:
+                        self.client_sock.settimeout(self.timeout)
+                except Exception as e:
+                    print(f"[Command Handler] Error receiving from client: {e}")
+                    if self.client_sock:
+                        try:
+                            self.client_sock.settimeout(self.timeout)
+                        except:
+                            pass
+                
+                # Process command queue (from shell input)
                 with self.command_lock:
-                    if self.command_queue and self.connected:
+                    if self.command_queue and self.connected and self.client_sock:
                         command = self.command_queue.popleft()
-                        self._send_command(command)
+                        # Send command from shell input as raw text
+                        self._send_raw_command(command)
                     else:
                         time.sleep(0.1)  # Small delay when no commands
                 
             except Exception as e:
                 print(f"[Command Handler] Error: {e}")
+                import traceback
+                traceback.print_exc()
                 self.connected = False
                 if self.client_sock:
                     try:
@@ -405,34 +463,52 @@ class CommandHandlerThread(threading.Thread):
                 pass
         print(f"[Command Handler] Thread stopped")
     
-    def _send_command(self, command: str):
-        """Send command to base board"""
+    def _send_raw_command(self, command: str):
+        """Send command as raw text (as-is, no length prefix) to connected client/base board"""
         if not self.client_sock or not self.connected:
             print(f"[Command Handler] Not connected, cannot send command")
             return
             
         try:
-            # Send command with length prefix
+            # Send command as raw text (as-is, no length prefix)
+            # This allows commands like "CMD:REQ_CONN:21001A0012505037 5555" to be sent directly
             command_bytes = command.encode('utf-8')
-            length_bytes = len(command_bytes).to_bytes(4, byteorder='big')
-            
-            self.client_sock.sendall(length_bytes)
             self.client_sock.sendall(command_bytes)
+            print(f"[Command Handler] Sent command (raw text): {command}")
             
-            # Wait for response
+            # Try to receive response (non-blocking, short timeout)
             try:
-                response_length_data = self.client_sock.recv(4)
-                if response_length_data and len(response_length_data) == 4:
-                    response_length = int.from_bytes(response_length_data, byteorder='big')
-                    response_data = self.client_sock.recv(response_length)
-                    response = response_data.decode('utf-8', errors='ignore')
-                    print(f"[Command Handler] Response: {response}")
+                self.client_sock.settimeout(1.0)  # Short timeout for response
+                # Try length-prefixed response first
+                response_length_data = self.client_sock.recv(4, socket.MSG_PEEK)
+                if len(response_length_data) == 4:
+                    try:
+                        response_length = int.from_bytes(response_length_data, byteorder='big')
+                        if 0 < response_length < 65536:
+                            # Consume the 4 bytes
+                            self.client_sock.recv(4)
+                            response_data = self.client_sock.recv(response_length)
+                            response = response_data.decode('utf-8', errors='ignore')
+                            print(f"[Command Handler] Response (length-prefixed): {response}")
+                            self.client_sock.settimeout(self.timeout)
+                            return
+                    except (ValueError, OverflowError):
+                        pass
+                
+                # Fallback: receive raw text response
+                raw_response = self.client_sock.recv(4096)
+                if raw_response:
+                    response = raw_response.decode('utf-8', errors='ignore').strip()
+                    print(f"[Command Handler] Response (raw text): {response}")
                 else:
                     print(f"[Command Handler] No response received")
+                self.client_sock.settimeout(self.timeout)
             except socket.timeout:
-                print(f"[Command Handler] Timeout waiting for response")
+                # No response received, that's okay
+                self.client_sock.settimeout(self.timeout)
             except Exception as e:
                 print(f"[Command Handler] Error receiving response: {e}")
+                self.client_sock.settimeout(self.timeout)
             
         except Exception as e:
             print(f"[Command Handler] Error sending command: {e}")
@@ -499,9 +575,15 @@ class RealTimeDataThread(threading.Thread):
                 print(f"[Real-time Data] Server listening on {self.host}:{self.port}")
             except Exception as e:
                 print(f"[Real-time Data] Bind error: {e}")
-                self.sock.close()
+                if self.sock:
+                    self.sock.close()
                 self.sock = None
                 return
+        
+        # Check if server socket was created successfully
+        if not self.sock:
+            print(f"[Real-time Data] Server socket not initialized, thread stopping")
+            return
         
         while self.running:
             try:
@@ -521,33 +603,76 @@ class RealTimeDataThread(threading.Thread):
                             time.sleep(1)
                         continue
                 
+                # Only process if we have a connected client
+                if not self.client_sock or not self.connected:
+                    time.sleep(0.1)
+                    continue
+                
                 # Receive sensor data from client
                 try:
-                    # Receive data length
-                    length_data = self.client_sock.recv(4)
-                    if not length_data or len(length_data) < 4:
-                        raise ConnectionError("Failed to receive data length")
+                    # Try to receive with length prefix first, fallback to raw text
+                    # Peek at first 4 bytes to determine protocol
+                    if not self.client_sock:
+                        continue
+                    self.client_sock.settimeout(0.5)
+                    try:
+                        peek_data = self.client_sock.recv(4, socket.MSG_PEEK)
+                        if len(peek_data) == 4:
+                            # Check if first 4 bytes look like a length prefix (reasonable size)
+                            try:
+                                potential_length = int.from_bytes(peek_data, byteorder='big')
+                                # If it's a reasonable length (less than 64KB), try length-prefixed
+                                if 0 < potential_length < 65536:
+                                    # Consume the 4 bytes we peeked
+                                    length_data = self.client_sock.recv(4)
+                                    data_length = potential_length
+                                    
+                                    # Receive actual data
+                                    received = 0
+                                    data_parts = []
+                                    while received < data_length:
+                                        chunk = self.client_sock.recv(min(4096, data_length - received))
+                                        if not chunk:
+                                            raise ConnectionError("Connection closed during data receive")
+                                        data_parts.append(chunk)
+                                        received += len(chunk)
+                                    
+                                    data = b''.join(data_parts)
+                                    self._process_sensor_data(data.decode('utf-8', errors='ignore'))
+                                    
+                                    # Display data periodically
+                                    current_time = time.time()
+                                    if current_time - self.last_display_time >= self.display_interval:
+                                        self._display_sensor_data()
+                                        self.last_display_time = current_time
+                                    
+                                    self.client_sock.settimeout(self.timeout)
+                                    continue
+                            except (ValueError, OverflowError):
+                                # Not a valid length, treat as raw text
+                                pass
+                    except socket.timeout:
+                        # No data available yet
+                        self.client_sock.settimeout(self.timeout)
+                        continue
                     
-                    data_length = int.from_bytes(length_data, byteorder='big')
+                    # Fallback: Receive raw text (for testing with PuTTY/Tera Term)
+                    self.client_sock.settimeout(self.timeout)
+                    raw_data = self.client_sock.recv(4096)
+                    if not raw_data:
+                        raise ConnectionError("Connection closed")
                     
-                    # Receive actual data
-                    received = 0
-                    data_parts = []
-                    while received < data_length:
-                        chunk = self.client_sock.recv(min(4096, data_length - received))
-                        if not chunk:
-                            raise ConnectionError("Connection closed during data receive")
-                        data_parts.append(chunk)
-                        received += len(chunk)
-                    
-                    data = b''.join(data_parts)
-                    self._process_sensor_data(data.decode('utf-8', errors='ignore'))
-                    
-                    # Display data periodically
-                    current_time = time.time()
-                    if current_time - self.last_display_time >= self.display_interval:
-                        self._display_sensor_data()
-                        self.last_display_time = current_time
+                    # Decode and process
+                    data = raw_data.decode('utf-8', errors='ignore').strip()
+                    if data:
+                        print(f"[Real-time Data] Received raw text data (length: {len(data)} bytes)")
+                        self._process_sensor_data(data)
+                        
+                        # Display data periodically
+                        current_time = time.time()
+                        if current_time - self.last_display_time >= self.display_interval:
+                            self._display_sensor_data()
+                            self.last_display_time = current_time
                     
                 except socket.timeout:
                     # Timeout is acceptable, continue waiting
@@ -594,12 +719,32 @@ class RealTimeDataThread(threading.Thread):
         try:
             # Try to parse as JSON
             sensor_data = json.loads(data)
-            sensor_data['timestamp'] = datetime.now().isoformat()
+            
+            # Handle format: {"21001A0012505037":"1195.0"} or {"device_id": "value"}
+            # Convert string values to appropriate types (float if numeric)
+            processed_data = {}
+            for device_id, value in sensor_data.items():
+                # Try to convert value to float if it's a numeric string
+                if isinstance(value, str):
+                    try:
+                        # Try to convert to float
+                        processed_data[device_id] = float(value)
+                    except ValueError:
+                        # Keep as string if not numeric
+                        processed_data[device_id] = value
+                else:
+                    processed_data[device_id] = value
+            
+            # Add timestamp
+            processed_data['timestamp'] = datetime.now().isoformat()
             
             with self.lock:
-                self.sensor_data_list.append(sensor_data)
+                self.sensor_data_list.append(processed_data)
             
-        except json.JSONDecodeError:
+            # Print immediate confirmation
+            print(f"[Real-time Data] Received data: {json.dumps({k: v for k, v in processed_data.items() if k != 'timestamp'})}")
+            
+        except json.JSONDecodeError as e:
             # If not JSON, try to parse as simple format
             # Format: "sensor1:value1,sensor2:value2,..."
             try:
@@ -616,10 +761,15 @@ class RealTimeDataThread(threading.Thread):
                 
                 with self.lock:
                     self.sensor_data_list.append(sensor_dict)
+                
+                print(f"[Real-time Data] Received data (simple format): {sensor_dict}")
                     
             except Exception as e:
                 print(f"[Real-time Data] Parse error: {e}")
                 print(f"[Real-time Data] Raw data: {data}")
+        except Exception as e:
+            print(f"[Real-time Data] Processing error: {e}")
+            print(f"[Real-time Data] Raw data: {data[:200]}...")
     
     def _display_sensor_data(self):
         """Display recent sensor data"""
@@ -637,11 +787,25 @@ class RealTimeDataThread(threading.Thread):
             recent_data = list(self.sensor_data_list)[-5:]
             for i, data in enumerate(recent_data, 1):
                 print(f"\n  Data Point {i}:")
-                for key, value in data.items():
-                    if key != 'timestamp':
-                        print(f"    {key}: {value}")
+                # Display device ID and sensor value pairs
+                device_data = {k: v for k, v in data.items() if k != 'timestamp'}
+                if device_data:
+                    for device_id, sensor_value in device_data.items():
+                        # Format numeric values nicely
+                        if isinstance(sensor_value, float):
+                            print(f"    Device ID: {device_id}  |  Value: {sensor_value:.2f}")
+                        else:
+                            print(f"    Device ID: {device_id}  |  Value: {sensor_value}")
+                else:
+                    print("    (No device data)")
+                
                 if 'timestamp' in data:
-                    print(f"    Time: {data['timestamp']}")
+                    # Extract just the time part for cleaner display
+                    try:
+                        time_str = data['timestamp'].split('T')[1].split('.')[0] if 'T' in data['timestamp'] else data['timestamp']
+                        print(f"    Time: {time_str}")
+                    except:
+                        print(f"    Time: {data['timestamp']}")
             
             print("=" * 60 + "\n")
     
