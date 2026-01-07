@@ -338,12 +338,15 @@ class CommandHandlerThread(threading.Thread):
         self.port = port
         self.timeout = timeout
         self.sock: Optional[socket.socket] = None
-        self.client_sock: Optional[socket.socket] = None
+        self.client_sock: Optional[socket.socket] = None  # Terminal client (PuTTY) or base board
+        self.base_board_sock: Optional[socket.socket] = None  # Base board connection (if separate)
         self.running = False
         self.connected = False
+        self.base_board_connected = False
         self.lock = threading.Lock()
         self.command_queue = deque()
         self.command_lock = threading.Lock()
+        self.pending_command = None  # Store command waiting for response
         
     def run(self):
         """Main thread execution loop - server mode"""
@@ -400,19 +403,24 @@ class CommandHandlerThread(threading.Thread):
                     time.sleep(0.1)
                     continue
                 
-                # Check for incoming commands from connected client (raw text from PuTTY/Tera Term)
-                # Commands received from client are sent as-is (raw text) to the base board
+                # Check for incoming data from connected client
+                # Distinguish between commands (from terminal) and responses (from base board)
                 try:
                     if self.client_sock:
                         self.client_sock.settimeout(0.1)  # Short timeout for non-blocking check
                         raw_data = self.client_sock.recv(4096)
                         if raw_data:
-                            # Received command from client (PuTTY/Tera Term), send as raw text to base board
-                            command = raw_data.decode('utf-8', errors='ignore').strip()
-                            if command:
-                                print(f"[Command Handler] Received command from client: {command}")
-                                # Send command as raw text (as-is, no length prefix)
-                                self._send_raw_command(command)
+                            data = raw_data.decode('utf-8', errors='ignore').strip()
+                            if data:
+                                # Check if this is a response (JSON with N_id, GN, etc.) or a command
+                                if self._is_command_response(data):
+                                    # This is a RESPONSE from base board - only display it, do NOT send back
+                                    print(f"[Command Handler] Received response from base board")
+                                    self._process_command_response(data)
+                                else:
+                                    # This is a COMMAND from terminal client - send to base board
+                                    print(f"[Command Handler] Received command from terminal: {data}")
+                                    self._send_raw_command(data)
                         if self.client_sock:
                             self.client_sock.settimeout(self.timeout)
                 except socket.timeout:
@@ -426,6 +434,11 @@ class CommandHandlerThread(threading.Thread):
                             self.client_sock.settimeout(self.timeout)
                         except:
                             pass
+                
+                # Also check for responses from base board (if using same socket)
+                # Note: If terminal client and base board use the same connection,
+                # we need to distinguish between commands and responses
+                # For now, we handle responses in _send_raw_command after sending command
                 
                 # Process command queue (from shell input)
                 with self.command_lock:
@@ -464,51 +477,19 @@ class CommandHandlerThread(threading.Thread):
         print(f"[Command Handler] Thread stopped")
     
     def _send_raw_command(self, command: str):
-        """Send command as raw text (as-is, no length prefix) to connected client/base board"""
+        """Send command as raw text (as-is, no length prefix) to base board"""
         if not self.client_sock or not self.connected:
             print(f"[Command Handler] Not connected, cannot send command")
             return
             
         try:
-            # Send command as raw text (as-is, no length prefix)
+            # Send command as raw text (as-is, no length prefix) to base board
             # This allows commands like "CMD:REQ_CONN:21001A0012505037 5555" to be sent directly
             command_bytes = command.encode('utf-8')
             self.client_sock.sendall(command_bytes)
-            print(f"[Command Handler] Sent command (raw text): {command}")
-            
-            # Try to receive response (non-blocking, short timeout)
-            try:
-                self.client_sock.settimeout(1.0)  # Short timeout for response
-                # Try length-prefixed response first
-                response_length_data = self.client_sock.recv(4, socket.MSG_PEEK)
-                if len(response_length_data) == 4:
-                    try:
-                        response_length = int.from_bytes(response_length_data, byteorder='big')
-                        if 0 < response_length < 65536:
-                            # Consume the 4 bytes
-                            self.client_sock.recv(4)
-                            response_data = self.client_sock.recv(response_length)
-                            response = response_data.decode('utf-8', errors='ignore')
-                            print(f"[Command Handler] Response (length-prefixed): {response}")
-                            self.client_sock.settimeout(self.timeout)
-                            return
-                    except (ValueError, OverflowError):
-                        pass
-                
-                # Fallback: receive raw text response
-                raw_response = self.client_sock.recv(4096)
-                if raw_response:
-                    response = raw_response.decode('utf-8', errors='ignore').strip()
-                    print(f"[Command Handler] Response (raw text): {response}")
-                else:
-                    print(f"[Command Handler] No response received")
-                self.client_sock.settimeout(self.timeout)
-            except socket.timeout:
-                # No response received, that's okay
-                self.client_sock.settimeout(self.timeout)
-            except Exception as e:
-                print(f"[Command Handler] Error receiving response: {e}")
-                self.client_sock.settimeout(self.timeout)
+            print(f"[Command Handler] Sent command to base board: {command}")
+            # Note: Response will be received in the main loop and handled by _is_command_response()
+            # We do NOT wait for response here to avoid blocking
             
         except Exception as e:
             print(f"[Command Handler] Error sending command: {e}")
@@ -519,6 +500,61 @@ class CommandHandlerThread(threading.Thread):
                 except:
                     pass
                 self.client_sock = None
+    
+    def _is_command_response(self, data: str) -> bool:
+        """Check if the received data is a command response (JSON with response fields)"""
+        try:
+            # Try to parse as JSON
+            json_data = json.loads(data)
+            # Check if it contains response fields (N_id, GN, etc.)
+            response_fields = ["N_id", "GN", "GU", "zC", "sC", "sCon", "sR", "lCD"]
+            if any(field in json_data for field in response_fields):
+                return True
+        except (json.JSONDecodeError, TypeError):
+            pass
+        return False
+    
+    def _process_command_response(self, response: str):
+        """Process and display command response (DO NOT send back to terminal client)"""
+        if not response:
+            return
+        
+        try:
+            # Try to parse as JSON
+            response_data = json.loads(response)
+            
+            # Display formatted response
+            print("\n" + "=" * 60)
+            print("[Command Handler] Command Response Received:")
+            print("-" * 60)
+            
+            # Map field names to readable labels
+            field_labels = {
+                "N_id": "Node ID",
+                "GN": "Group Name",
+                "GU": "Group Unit",
+                "zC": "Zero Count",
+                "sC": "Scale Count",
+                "sCon": "Scale Connection",
+                "sR": "Scale Rate",
+                "lCD": "Last Connection Date"
+            }
+            
+            # Display each field
+            for key, value in response_data.items():
+                label = field_labels.get(key, key)
+                # Format value (remove extra spaces for GN field)
+                formatted_value = value.strip() if isinstance(value, str) else value
+                print(f"  {label:25} : {formatted_value}")
+            
+            print("=" * 60 + "\n")
+            
+        except json.JSONDecodeError:
+            # Not JSON, display as raw text
+            print(f"[Command Handler] Response (raw text): {response}")
+        except Exception as e:
+            print(f"[Command Handler] Error processing response: {e}")
+            print(f"[Command Handler] Raw response: {response}")
     
     def send_command(self, command: str):
         """Add command to queue (thread-safe)"""

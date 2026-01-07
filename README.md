@@ -28,11 +28,15 @@ This Python application creates 3 worker threads (in addition to the main thread
 - **Port**: Default 8001
 
 ### Thread 2: Command Handler Socket (Server)
-- **Purpose**: Server socket that sends commands to base board
+- **Purpose**: Server socket that sends commands to base board and handles responses
 - **Input**: Commands entered from shell (Forlinx terminal) or from connected clients (PuTTY/Tera Term)
 - **Behavior**: Server listens for base board connection, accepts commands from shell or clients and sends them as raw text to connected base board
 - **Command Format**: Commands are sent as-is (raw text), no length prefix. Example: `"CMD:REQ_CONN:21001A0012505037 5555"`
-- **Response**: Displays response from base board (supports both length-prefixed and raw text responses)
+- **Response Handling**: 
+  - Automatically detects and distinguishes between commands and responses
+  - Responses are parsed and displayed in formatted format (NOT sent back to terminal client)
+  - Supports both length-prefixed and raw text response protocols
+  - Response format: JSON with fields like `N_id`, `GN`, `GU`, `zC`, `sC`, `sCon`, `sR`, `lCD`
 - **Port**: Default 8002
 
 ### Thread 3: Real-time Data Monitoring Socket (Server)
@@ -149,6 +153,34 @@ The format uses device IDs as keys and sensor values as strings. Numeric values 
 ```
 sensor1:25.5,sensor2:100,sensor3:on
 ```
+
+### Command Response Format
+
+**JSON Format (Command Response):**
+```json
+{
+  "N_id": "21001A0012505037",
+  "GN": "   CO   ",
+  "GU": "0",
+  "zC": "1738",
+  "sC": "2542",
+  "sCon": "200",
+  "sR": "1000",
+  "lCD": "15-10-24"
+}
+```
+
+The command handler automatically detects responses and displays them in a formatted, readable format with field labels:
+- `N_id` → Node ID
+- `GN` → Group Name
+- `GU` → Group Unit
+- `zC` → Zero Count
+- `sC` → Scale Count
+- `sCon` → Scale Connection
+- `sR` → Scale Rate
+- `lCD` → Last Connection Date
+
+**Important**: Responses are only displayed in the server terminal and are NOT sent back to the terminal client.
 
 ## Protocol Details
 
@@ -285,6 +317,27 @@ Most Recent Data Points:
 ============================================================
 ```
 
+### Command Response Display:
+
+```
+[Command Handler] Received command from terminal: CMD:REQ_CONN:21001A0012505037 5555
+[Command Handler] Sent command to base board: CMD:REQ_CONN:21001A0012505037 5555
+[Command Handler] Received response from base board
+
+============================================================
+[Command Handler] Command Response Received:
+------------------------------------------------------------
+  Node ID                  : 21001A0012505037
+  Group Name               : CO
+  Group Unit               : 0
+  Zero Count               : 1738
+  Scale Count              : 2542
+  Scale Connection         : 200
+  Scale Rate               : 1000
+  Last Connection Date     : 15-10-24
+============================================================
+```
+
 ## Notes for iMX92 / Forlinx
 
 - Ensure network interfaces are properly configured
@@ -316,3 +369,11 @@ Most Recent Data Points:
 - Verify command handler thread is connected
 - Check base board is accepting commands
 - Verify command format matches base board expectations
+- Ensure commands are sent as raw text (no length prefix required)
+- Check that responses are being received (they should appear in server terminal, not sent back to client)
+
+### Response Handling
+- Responses are automatically detected and displayed in formatted format
+- Responses are NOT sent back to terminal clients (PuTTY/Tera Term)
+- If responses appear in terminal client, check that response detection is working correctly
+- Verify response format matches expected JSON structure with response fields
