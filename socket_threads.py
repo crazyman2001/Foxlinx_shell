@@ -990,21 +990,41 @@ class CommandInputThread(threading.Thread):
             data_status = "Connected" if self.realtime_data_thread.connected else "Disconnected"
             print(f"\n  Real-time Data Thread: {data_status}")
             
-            # Get sensor data count
+            # Get all sensor data
             sensor_data = self.realtime_data_thread.get_sensor_data()
             print(f"  Sensor Data Points Stored: {len(sensor_data)}")
             
-            # Show most recent data point if available
+            # Show all stored data points with timestamps
             if sensor_data:
-                latest = sensor_data[-1]
-                device_data = {k: v for k, v in latest.items() if k != 'timestamp'}
-                if device_data:
-                    print("  Most Recent Data:")
-                    for device_id, value in device_data.items():
-                        if isinstance(value, float):
-                            print(f"    {device_id}: {value:.2f}")
+                print("\n  All Stored Real-time Data:")
+                for i, data_point in enumerate(sensor_data, 1):
+                    device_data = {k: v for k, v in data_point.items() if k != 'timestamp'}
+                    timestamp = data_point.get('timestamp', 'N/A')
+                    
+                    # Format timestamp for display
+                    try:
+                        if 'T' in timestamp:
+                            # ISO format: extract date and time
+                            date_part, time_part = timestamp.split('T')
+                            time_display = time_part.split('.')[0] if '.' in time_part else time_part
+                            formatted_time = f"{date_part} {time_display}"
                         else:
-                            print(f"    {device_id}: {value}")
+                            formatted_time = timestamp
+                    except:
+                        formatted_time = timestamp
+                    
+                    print(f"\n    Data Point {i}:")
+                    print(f"      Timestamp: {formatted_time}")
+                    if device_data:
+                        for device_id, value in device_data.items():
+                            if isinstance(value, float):
+                                print(f"      Device ID: {device_id}  |  Value: {value:.2f}")
+                            else:
+                                print(f"      Device ID: {device_id}  |  Value: {value}")
+                    else:
+                        print("      (No device data)")
+            else:
+                print("\n  No sensor data stored yet")
         else:
             print("\n  Real-time Data Thread: Not initialized")
         

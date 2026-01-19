@@ -99,7 +99,7 @@ The `status` command provides a comprehensive overview:
 - **Thread Connection Status**: Shows if each of the 3 threads is connected
 - **Connected Devices**: Lists all devices with their status (active/deactive)
 - **Broadcast Nodes**: Shows available broadcast nodes
-- **Sensor Data**: Displays count of stored data points and most recent sensor reading
+- **Sensor Data**: Displays count of stored data points and **all stored real-time data with timestamps**
 
 ### Stopping the application:
 
@@ -278,8 +278,26 @@ Thread Status:
 
   Real-time Data Thread: Connected
   Sensor Data Points Stored: 15
-  Most Recent Data:
-    21001A0012505037: 1195.00
+
+  All Stored Real-time Data:
+
+    Data Point 1:
+      Timestamp: 2026-01-06 12:08:55
+      Device ID: 21001A0012505037  |  Value: 1190.50
+
+    Data Point 2:
+      Timestamp: 2026-01-06 12:08:56
+      Device ID: 21001A0012505037  |  Value: 1192.00
+
+    Data Point 3:
+      Timestamp: 2026-01-06 12:08:57
+      Device ID: 21001A0012505037  |  Value: 1193.50
+
+    ... (all stored data points shown)
+
+    Data Point 15:
+      Timestamp: 2026-01-06 12:09:09
+      Device ID: 21001A0012505037  |  Value: 1195.00
 ============================================================
 ```
 
